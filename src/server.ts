@@ -22,7 +22,7 @@ export async function buildApp(
   if (!["http:", "https:"].includes(expected.protocol))
     throw new Error("Base URL must be HTTP(S).");
   const config = new Configuration(options.dataDir, options.demo);
-  const unlock = lockVault(config.dir);
+  const unlock = await lockVault(config.dir);
   const archive = new Archive(config.dir);
   await seedDemo(config, archive);
   const clip = new Clip(config, archive);
@@ -361,7 +361,7 @@ export async function buildApp(
     if (timer) clearTimeout(timer);
     await sync.active;
     archive.close();
-    unlock();
+    await unlock();
   });
   app.decorate("vault", { config, archive, sync, clip });
   return app;

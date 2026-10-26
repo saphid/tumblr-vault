@@ -50,7 +50,8 @@ export function defaultDir() {
 export function atomicJSON(path: string, value: unknown) {
   const temp = path + "." + randomBytes(8).toString("hex") + ".tmp";
   writeFileSync(temp, JSON.stringify(value, null, 2), { mode: 0o600 });
-  const fd = openSync(temp, "r");
+  // Windows requires a writable handle for FlushFileBuffers (fsync).
+  const fd = openSync(temp, "r+");
   try {
     fsyncSync(fd);
   } finally {

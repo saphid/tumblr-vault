@@ -567,16 +567,19 @@ test("instance lock refuses concurrent users and releases only its own lock", as
   const f = fixture();
   try {
     const { lockVault } = await import("../src/lock.js");
-    const release = lockVault(f.dir);
-    assert.throws(() => lockVault(f.dir), /already open/);
-    release();
-    lockVault(f.dir)();
+    const release = await lockVault(f.dir);
+    await assert.rejects(() => lockVault(f.dir, false), /already open/);
+    await release();
+    await (
+      await lockVault(f.dir)
+    )();
   } finally {
     f.close();
   }
 });
 
 test("legacy import is offline, preserves source/raw/media and leaves source unchanged", async () => {
+  const { default: sharp } = await import("sharp");
   const { DatabaseSync } = await import("node:sqlite");
   const { mkdirSync, writeFileSync } = await import("node:fs");
   const { importLegacy } = await import("../src/import.js");
@@ -611,13 +614,18 @@ test("legacy import is offline, preserves source/raw/media and leaves source unc
         "image",
         "abc",
         "abc",
-        null,
+        "legacy.jpg",
         3,
         null,
         null,
         null,
       );
     writeFileSync(join(src, "media", "abc"), "abc");
+    await sharp({
+      create: { width: 8, height: 8, channels: 3, background: "#554466" },
+    })
+      .jpeg()
+      .toFile(join(src, "thumbs", "legacy.jpg"));
     old.close();
     const sourceBytes = readFileSync(join(src, "data", "archive.sqlite"));
     const result = await importLegacy(src, dest);
@@ -630,6 +638,10 @@ test("legacy import is offline, preserves source/raw/media and leaves source unc
     assert.equal(db.search({ profile: "a" }).total, 1);
     assert.equal(db.detail("1")!.media[0].saved, true);
     assert.equal(db.detail("1")!.media[0].bytes, 3);
+    assert.equal(
+      (await sharp(join(dest, "thumbs", "abc.webp")).metadata()).format,
+      "webp",
+    );
     db.close();
     assert(!new Configuration(dest).value.accounts[0].token);
     await assert.rejects(() => importLegacy(src, src));

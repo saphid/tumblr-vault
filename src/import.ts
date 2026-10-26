@@ -4,6 +4,7 @@ import { copyFileSync, existsSync, constants, statfsSync } from "node:fs";
 import { Configuration } from "./config.js";
 import { Archive, type Raw } from "./store.js";
 import { lockVault } from "./lock.js";
+import sharp from "sharp";
 // Explicit, offline migration: source database opened read-only; credentials are never imported.
 export async function importLegacy(from: string, to: string) {
   const source = resolve(from);
@@ -18,10 +19,10 @@ export async function importLegacy(from: string, to: string) {
     );
   const c = new Configuration(destination);
   if (c.value.demo) throw new Error("Cannot import into a demo vault.");
-  const unlock = lockVault(c.dir);
+  const unlock = await lockVault(c.dir);
   const sourceDb = join(source, "data", "archive.sqlite");
   if (!existsSync(sourceDb)) {
-    unlock();
+    await unlock();
     throw new Error(
       "Source must contain data/archive.sqlite from the legacy archive.",
     );
@@ -63,7 +64,11 @@ export async function importLegacy(from: string, to: string) {
         .prepare("SELECT id FROM media WHERE url=?")
         .get(media.url);
       if (!current) continue;
-      const copy = (kind: string, relative: string | null, hash: string) => {
+      const copy = async (
+        kind: string,
+        relative: string | null,
+        hash: string,
+      ) => {
         if (!relative) return null;
         const origin = resolve(source, kind, relative);
         if (
@@ -78,14 +83,16 @@ export async function importLegacy(from: string, to: string) {
           );
         const name = hash + (kind === "thumbs" ? ".webp" : "");
         const target = join(c.dir, kind, name);
-        if (!existsSync(target))
-          copyFileSync(origin, target, constants.COPYFILE_EXCL);
+        if (!existsSync(target)) {
+          if (kind === "thumbs") await sharp(origin).webp().toFile(target);
+          else copyFileSync(origin, target, constants.COPYFILE_EXCL);
+        }
         files++;
         return name;
       };
       const key = media.sha256 || String(current.id);
-      const path = copy("media", media.path, key);
-      const thumb = copy("thumbs", media.thumb, key);
+      const path = await copy("media", media.path, key);
+      const thumb = await copy("thumbs", media.thumb, key);
       db.db
         .prepare(
           "UPDATE media SET hash=?,path=?,thumb=?,bytes=?,error=?,embedding=?,model=? WHERE id=?",
@@ -112,6 +119,6 @@ export async function importLegacy(from: string, to: string) {
   } finally {
     old.close();
     db.close();
-    unlock();
+    await unlock();
   }
 }
