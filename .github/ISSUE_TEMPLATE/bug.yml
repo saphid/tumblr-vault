@@ -1,0 +1,23 @@
+name: Report a bug
+description: Help make your archive more dependable.
+body:
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect, and what happened?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version and install method
+      placeholder: v1.0.0 · npm / Docker · operating system
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Use invented examples. Never include tokens, account details, post text, databases or private media.
+    validations:
+      required: true

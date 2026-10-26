@@ -1,0 +1,14 @@
+services:
+  vault:
+    image: ghcr.io/saphid/tumblr-vault:1.0.0
+    build: .
+    ports:
+      - "127.0.0.1:4318:4318"
+    environment:
+      VAULT_BASE_URL: "http://localhost:4318"
+    volumes:
+      - vault-data:/data
+    restart: unless-stopped
+    init: true
+volumes:
+  vault-data:

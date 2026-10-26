@@ -1,0 +1,67 @@
+{
+  "name": "tumblr-vault",
+  "version": "1.0.0",
+  "description": "Your Tumblr, kept. Local-first backup, reader and semantic image search with guided setup.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "tumblr-vault": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "public",
+    "README.md",
+    "LICENSE",
+    "compose.yaml",
+    "Dockerfile",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
+    "test": "tsx --test tests/*.test.ts",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "prepack": "npm run build",
+    "format": "prettier --write src client tests *.json vite.config.ts docs README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md .github",
+    "test:clip": "tsx tests/clip.integration.ts",
+    "test:install": "npm run build && tsx tests/install.smoke.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saphid/tumblr-vault.git"
+  },
+  "homepage": "https://github.com/saphid/tumblr-vault#readme",
+  "bugs": {
+    "url": "https://github.com/saphid/tumblr-vault/issues"
+  },
+  "keywords": [
+    "tumblr",
+    "backup",
+    "archive",
+    "self-hosted",
+    "clip",
+    "search",
+    "bm25"
+  ],
+  "dependencies": {
+    "@fastify/static": "^10.1.7",
+    "@huggingface/transformers": "^4.3.1",
+    "fastify": "^5.6.1",
+    "sharp": "^0.35.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "prettier": "^3.9.10",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0"
+  }
+}
