@@ -639,7 +639,8 @@ test("legacy import is offline, preserves source/raw/media and leaves source unc
     assert.equal(db.detail("1")!.media[0].saved, true);
     assert.equal(db.detail("1")!.media[0].bytes, 3);
     assert.equal(
-      (await sharp(join(dest, "thumbs", "abc.webp")).metadata()).format,
+      (await sharp(readFileSync(join(dest, "thumbs", "abc.webp"))).metadata())
+        .format,
       "webp",
     );
     db.close();
