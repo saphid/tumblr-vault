@@ -903,23 +903,51 @@ test("1.0.0 vaults migrate in place: BM25 order kept, updates keyed by rowid, ol
   }
 });
 
-test("per-record ingest cost stays flat as the archive grows", () => {
+test("FTS ingest updates use indexed rowid lookup at small and large archive sizes", () => {
   const f = fixture();
   try {
-    const timed = (from: number) => {
-      const began = performance.now();
-      for (let i = from; i < from + 500; i++)
-        f.db.ingest("a", "like", post("p" + i, { body: "record " + i }));
-      return performance.now() - began;
+    f.db.ingest("a", "like", post("p0"));
+    const prepare = f.db.db.prepare.bind(f.db.db);
+    const checkUpdate = () => {
+      const deletes: string[] = [];
+      const spy = mock.method(f.db.db, "prepare", (sql: string) => {
+        if (/^DELETE FROM fts\b/i.test(sql)) deletes.push(sql);
+        return prepare(sql);
+      });
+      try {
+        f.db.ingest("a", "like", post("p0", { body: "updated record" }));
+      } finally {
+        spy.mock.restore();
+      }
+      assert.equal(deletes.length, 1, "one FTS delete per updated post");
+      // Inspect the statement actually used by ingest, rather than a separate
+      // hand-written query. The old UNINDEXED id predicate scans every
+      // document on each update; its plan lacks a rowid equality constraint.
+      const plan = prepare("EXPLAIN QUERY PLAN " + deletes[0])
+        .all(1)
+        .map((row) => String(row.detail))
+        .join("; ");
+      assert.match(
+        plan,
+        /VIRTUAL TABLE INDEX \d+:=/,
+        "FTS delete needs rowid equality: " + plan,
+      );
+      assert.doesNotMatch(
+        plan,
+        /VIRTUAL TABLE INDEX \d+:(?:;|$)/,
+        "FTS delete must not hide a full scan in a subquery: " + plan,
+      );
+      assert.equal(
+        prepare("SELECT COUNT(*) n FROM fts WHERE id=?").get("p0")!.n,
+        1,
+      );
     };
-    const early = timed(0);
+    checkUpdate();
     f.db.transaction(() => {
       for (let i = 1000; i < 21000; i++)
         f.db.ingest("a", "like", post("p" + i, { body: "record " + i }));
     });
-    const late = timed(30000);
-    // 1.0.0 scanned the whole FTS table on every record: about 6x slower at this size.
-    assert.ok(late < early * 2.5 + 250, `early ${early} ms, late ${late} ms`);
+    checkUpdate();
   } finally {
     f.close();
   }

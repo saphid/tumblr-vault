@@ -114,8 +114,33 @@ The frozen executable/config/test patch SHA-256 was
 The reviewer passed strict TypeScript checking of the install smoke script,
 Prettier and the focused workflow regression. The parent separately passed
 all 50 tests, both project typechecks and the complete corrected fresh-install
-smoke, including forced-kill recovery. Windows execution of the corrected test
-is pending cross-platform CI at this point in the record.
+smoke, including forced-kill recovery. Windows execution of the corrected test passed in the
+[follow-up push run](https://github.com/saphid/tumblr-vault/actions/runs/40464900674).
+That run's Linux job failed an existing wall-clock ingest assertion (229 ms
+versus 2,374 ms); its macOS and Docker jobs passed. The concurrent
+[PR run](https://github.com/saphid/tumblr-vault/actions/runs/40464937953) passed
+Linux and macOS, illustrating why wall-clock thresholds are unsuitable as the
+only regression signal here.
+
+The ingest test now captures the DELETE statement actually issued by ingest
+and checks SQLite's rowid-equality query plan at both small and 20,000-record
+archive sizes. It also verifies that updating leaves exactly one FTS row.
+In an isolated source copy, restoring the old `id=?` full-scan deletion makes
+this regression fail; the current rowid deletion passes. The complete 50-test
+suite, typechecks and formatting pass locally. The published performance
+benchmarks above remain measurements rather than CI timing requirements.
+
+Read-only review of the deterministic regression (actual `claudeAgent` /
+`claude-opus-5-5`, high, completed; parent-recorded task ID
+`node:delegated-task:command%3Amcp%3A2b19377d-f9ac-4d5e-a264-1bc810a3d435%3Adelegate-task%3Atumblr-vault-queryplan-test-review-20261027-r1`)
+passed the focused test and found no blocking issues in frozen patch
+`4e42901f4113ca6f8adf2ec9a9fc998bd9a0b71d26f423004e28e6a2954f070e`.
+It identified a test-strength gap: rowid equality in one plan node could hide
+a full FTS scan in a subquery. The parent added the reviewer's suggested
+rejection for those scan nodes and verified both proposed subquery forms fail
+while the production query passes. This test covers FTS update plans, not the
+performance of every ingest statement; the measurements above remain useful
+for broader performance evaluation.
 
 **Post-release workflow hardening:** semver prerelease tags such as
 `v1.1.0-rc.1` no longer explicitly publish `latest`; stable and manual branch
