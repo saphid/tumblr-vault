@@ -1108,6 +1108,14 @@ test("workflows pin every action to a full commit SHA and manual image runs alwa
     versionRule.includes("enable=${{ startsWith(github.ref, 'refs/tags/v') }}"),
     "only v-prefixed release tags may emit version images",
   );
+  const latestRule = release
+    .split("\n")
+    .find((line) => line.includes("type=raw,value=latest"))!;
+  assert.ok(
+    latestRule.includes("startsWith(github.ref, 'refs/tags/v')") &&
+      latestRule.includes("!contains(github.ref_name, '-')"),
+    "prerelease and non-release refs must not overwrite latest",
+  );
   const branchRule = release
     .split("\n")
     .find((line) => line.includes("type=ref,event=branch"))!;

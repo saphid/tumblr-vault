@@ -22,11 +22,11 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
-          # A manual run from a branch publishes branch and commit tags only; release
-          # tags (version, latest) come only from v* tags. The list is never empty.
+          # v-prefixed semver prereleases keep their version tag without moving latest.
+          # Branch/manual runs always have a branch or commit tag.
           tags: |
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=ref,event=branch,prefix=branch-
             type=sha,format=long,enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2

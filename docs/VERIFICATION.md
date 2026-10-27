@@ -84,15 +84,73 @@ requirement/refusal/acceptance, bundled UI, BM25, eight saved originals,
 non-root UID 1000, graceful restart and forced SIGKILL/restart with the same
 volume. Sessions were locked after both restarts; the filesystem lease and
 saved content recovered. The test container and volume were removed. This
-checks the source candidate, not the as-yet-unpublished registry image.
+checks the source candidate; the separate registry-image checks below establish published-image behavior.
 
-**Not yet established for 1.0.1:**
+**Cross-platform CI:** [run 40462916102](https://github.com/saphid/tumblr-vault/actions/runs/40462916102)
+passed on source [d39af0f](https://github.com/saphid/tumblr-vault/commit/d39af0f43b4b8f489498b50746a1a2591591774f).
+Windows, macOS and Linux each passed all 50 tests, both typechecks, production
+build, dependency audit and fresh npm install/setup/search/restart checks.
+The Linux Docker build/start job also passed. The production dependency audit
+reported zero known vulnerabilities on 2026-10-27.
 
-- cross-platform CI on macOS, Linux and Windows;
-- the published multi-architecture image;
-- a GitHub release tarball and its checksum.
+**Restart-test correction after publication:** the duplicate tag-triggered
+[CI run 40463138993](https://github.com/saphid/tumblr-vault/actions/runs/40463138993)
+failed its Windows fresh-install startup check twice, despite the earlier pass
+on the identical source. Windows terminates Node forcibly on SIGTERM, leaving
+the filesystem lease until expiry. The smoke test allowed roughly ten seconds
+for startup, shorter than the lease plus lock retry window. A local installed
+package reproduced the timeout after SIGKILL at 10.26 seconds. The test now
+allows thirty seconds, bounds each health request, reports the last health
+error or early process exit, and checks forced-kill recovery explicitly on all
+platforms. This changes test coverage rather than the released runtime or its
+lease settings. Follow-up cross-platform CI is recorded after it completes.
 
-These follow the 1.0.0 process below and are recorded here when they complete. Real Tumblr OAuth, a live backup and Immich interoperability remain untested, as for 1.0.0.
+The combined test/workflow delta was independently reviewed read-only on actual
+`claudeAgent` / `claude-opus-5-5`, high, final status completed, with no
+introduced bugs found. Parent-recorded task ID:
+`node:delegated-task:command%3Amcp%3A2b19377d-f9ac-4d5e-a264-1bc810a3d435%3Adelegate-task%3Atumblr-vault-install-lease-review-20261027-r1`.
+The frozen executable/config/test patch SHA-256 was
+`f75feb6677d657f2cc950bc46d4ddc049c0dad647bf091c55113a886cc521955`.
+The reviewer passed strict TypeScript checking of the install smoke script,
+Prettier and the focused workflow regression. The parent separately passed
+all 50 tests, both project typechecks and the complete corrected fresh-install
+smoke, including forced-kill recovery. Windows execution of the corrected test
+is pending cross-platform CI at this point in the record.
+
+**Post-release workflow hardening:** semver prerelease tags such as
+`v1.1.0-rc.1` no longer explicitly publish `latest`; stable and manual branch
+rules retain their behavior. Read-only independent review (actual
+`claudeAgent` / `claude-opus-5-5`, high, completed; parent-recorded task ID
+`node:delegated-task:command%3Amcp%3A2b19377d-f9ac-4d5e-a264-1bc810a3d435%3Adelegate-task%3Atumblr-vault-prerelease-latest-review-20261027-r1`)
+found no introduced bugs in frozen patch
+`6bfbd739d1028394b4c39747bd2da1936663ab236793767af321eead55643083`.
+The review used pinned-action source inspection; no prerelease publication was
+performed. Existing release tags and artifacts were not changed.
+
+**Published npm artifact:** [v1.0.1](https://github.com/saphid/tumblr-vault/releases/tag/v1.0.1)
+contains the compiled tarball and SHA256SUMS. Anonymous downloads matched
+SHA-256 `919b958d04e127ae89b54a80e5926dbd269cf7e9fd630d245b53066d0326c02c`.
+A fresh global install from the public download URL passed the complete
+setup/search/restart smoke check, including operation without the optional CLIP
+runtime and an exposed setup code. The exact tarball also installed on Linux.
+Real local CLIP inference from the compiled installed package passed with
+normalized 512D vectors, persisted indexing and image self-similarity. The model
+came from an existing public-model cache; a fresh model download was not tested.
+
+**Published container:** [release workflow 40463138999](https://github.com/saphid/tumblr-vault/actions/runs/40463138999)
+passed. Anonymous OCI inspection found `linux/amd64` and `linux/arm64` manifests
+at image index digest
+`sha256:9269012b4b60c5e715fc07c11d9044a21b01ab9e4b27f94c0ddf21005f85135c`.
+Both `1.0.1` and `latest` point to that digest. A Linux amd64 pull with an empty
+Docker credential configuration passed setup-code refusal/acceptance, bundled
+UI, BM25, eight saved originals, non-root UID 1000, graceful restart and forced
+SIGKILL/restart with persisted data and locked sessions. The test container and
+volume were removed. ARM64 publication is verified; ARM64 execution is not.
+Existing 1.0.0 image and release artifacts were preserved.
+
+Real Tumblr OAuth, a full live backup and Immich interoperability remain
+untested for this release, as for 1.0.0. No new browser QA was performed for the
+1.0.1 setup/password fields.
 
 ## 1.0.0
 
