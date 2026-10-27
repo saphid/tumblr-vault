@@ -142,6 +142,19 @@ while the production query passes. This test covers FTS update plans, not the
 performance of every ingest statement; the measurements above remain useful
 for broader performance evaluation.
 
+**Final follow-up CI:** both the
+[PR run 40465650019](https://github.com/saphid/tumblr-vault/actions/runs/40465650019)
+and [push run 40465645126](https://github.com/saphid/tumblr-vault/actions/runs/40465645126)
+passed all four jobs on final head
+[ddc5ed0](https://github.com/saphid/tumblr-vault/commit/ddc5ed006549070e0c27240c52ea8037ade6250b).
+Windows, macOS and Linux each passed 50 tests, typechecks, production build,
+dependency audit and the corrected fresh-install smoke, including forced-kill
+lease recovery. The Docker build/start job also passed.
+[PR #3](https://github.com/saphid/tumblr-vault/pull/3) merged as
+[48b396b](https://github.com/saphid/tumblr-vault/commit/48b396b64c72f31f0dbf64f5641e5e9c59c0946c).
+The original tag-run failure remains in the record above; its cause was fixed
+in test timing without replacing the released app artifacts.
+
 **Post-release workflow hardening:** semver prerelease tags such as
 `v1.1.0-rc.1` no longer explicitly publish `latest`; stable and manual branch
 rules retain their behavior. Read-only independent review (actual
