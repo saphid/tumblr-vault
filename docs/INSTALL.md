@@ -49,7 +49,7 @@ docker run -d --name tumblr-vault --restart unless-stopped \
   ghcr.io/saphid/tumblr-vault:1.0.1
 ```
 
-Use `docker logs tumblr-vault` to read the one-time setup code. AMD64 and ARM64 builds are configured in the release workflow. Release tags publish `1.0.1` and `latest`. A manual workflow run from a branch publishes only branch and commit tags. The release verification page states which artifacts were actually built and tested. Docker Desktop provides Compose on macOS and Windows; on Linux install Docker Engine and the Compose plugin.
+Use `docker logs tumblr-vault` to read the one-time setup code. AMD64 and ARM64 builds are configured in the release workflow. Stable version tags publish `1.0.1` and `latest`. Semver prereleases such as `v1.1.0-rc.1` publish their version tag without moving `latest`. A manual workflow run from a branch publishes only branch and commit tags. The release verification page states which artifacts were actually built and tested. Docker Desktop provides Compose on macOS and Windows; on Linux install Docker Engine and the Compose plugin.
 
 ## The setup wizard
 

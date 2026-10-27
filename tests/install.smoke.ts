@@ -65,18 +65,35 @@ async function start(extra: string[] = [], dir = data) {
   );
   child.stdout?.on("data", (b) => (log += b));
   child.stderr?.on("data", (b) => (log += b));
-  for (let i = 0; i < 100; i++) {
+  // Windows forcibly terminates Node on SIGTERM. An unclean owner leaves the
+  // 10-second filesystem lease; startup may need the full 12-second lock retry.
+  const deadline = Date.now() + 30_000;
+  let lastHealth = "no response";
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null)
+      throw new Error(
+        "Installed server exited before becoming healthy: " + log,
+      );
     try {
-      if ((await fetch(base + "/health")).ok) return;
-    } catch {}
+      const health = await fetch(base + "/health", {
+        signal: AbortSignal.timeout(1000),
+      });
+      await health.text();
+      if (health.ok) return;
+      lastHealth = "HTTP " + health.status;
+    } catch (error) {
+      lastHealth = String((error as Error).cause || error);
+    }
     await new Promise((r) => setTimeout(r, 100));
   }
-  throw new Error("Installed server failed to start: " + log);
+  throw new Error(
+    "Installed server failed to start (" + lastHealth + "): " + log,
+  );
 }
-async function stop() {
-  if (!child || child.exitCode !== null) return;
+async function stop(signal: NodeJS.Signals = "SIGTERM") {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
   const stopped = new Promise<void>((r) => child!.once("exit", () => r()));
-  child.kill("SIGTERM");
+  child.kill(signal);
   await stopped;
 }
 try {
@@ -160,6 +177,24 @@ try {
   ).json()) as any;
   assert(search.total > 0);
   await stop();
+  // Exercise stale-lease recovery everywhere, including platforms where SIGTERM
+  // normally permits clean shutdown. The old ten-second startup budget fails here.
+  await start();
+  await stop("SIGKILL");
+  await start();
+  assert.equal((await fetch(base + "/api/search")).status, 401);
+  const recovered = await fetch(base + "/api/login", {
+    method: "POST",
+    headers: write,
+    body: JSON.stringify({ password: "synthetic-install-password" }),
+  });
+  assert.equal(recovered.status, 200);
+  cookie = recovered.headers.get("set-cookie")!.split(";")[0];
+  search = (await (
+    await fetch(base + "/api/search", { headers: { cookie } })
+  ).json()) as any;
+  assert.equal(search.total, 8);
+  await stop();
   // Reachable beyond loopback: the CLI prints a one-time setup code and setup needs it.
   const exposed = join(dir, "exposed-data");
   await start(["--base-url", "https://vault.example.test"], exposed);
@@ -169,7 +204,7 @@ try {
   assert(code, log);
   assert(log.includes("https://vault.example.test/#setup=" + code));
   console.log(
-    "PASS: fresh npm install, executable help/version, bundled UI, wizard setup, BM25 query, restart, locked session, persisted 8-entry archive, text-only install without the optional CLIP runtime, and the exposed setup code.",
+    "PASS: fresh npm install, executable help/version, bundled UI, wizard setup, BM25 query, restart, locked session, persisted 8-entry archive, text-only install without the optional CLIP runtime, forced-kill lease recovery, and the exposed setup code.",
   );
 } finally {
   await stop();
