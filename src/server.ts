@@ -3,17 +3,56 @@ import fastifyStatic from "@fastify/static";
 import { fileURLToPath } from "node:url";
 import { join, resolve, sep } from "node:path";
 import { existsSync, createReadStream } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { Configuration, checkPassword } from "./config.js";
 import { Archive } from "./store.js";
 import { Clip } from "./ml.js";
-import { Sync } from "./sync.js";
+import { Sync, backupDue } from "./sync.js";
 import { seedDemo } from "./demo.js";
 import { lockVault } from "./lock.js";
+import { sweepTemporary } from "./durable.js";
+import { Throttle } from "./throttle.js";
+const LOOPBACK_NAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+export const loopbackHost = (host = "127.0.0.1") =>
+  /^(localhost|::1|\[::1\]|127(\.\d{1,3}){3})$/i.test(host);
+// Parses a Host header or Origin into scheme-normalized hostname and port, so that
+// localhost:80 equals localhost for HTTP. Anything but a bare host[:port] is refused.
+function authority(protocol: string, value: string) {
+  if (!/^(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:\d{1,5})?$/i.test(value)) return;
+  try {
+    const u = new URL(protocol + "//" + value);
+    return u.hostname + ":" + u.port;
+  } catch {
+    return;
+  }
+}
+// Short enough to type from a terminal or container log: 20 characters, about 99 bits.
+function setupCode() {
+  const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  const bytes = randomBytes(20);
+  let code = "";
+  for (let i = 0; i < 20; i++) {
+    if (i && i % 5 === 0) code += "-";
+    code += alphabet[bytes[i] % alphabet.length];
+  }
+  return code;
+}
 export async function buildApp(
-  options: { dataDir?: string; demo?: boolean; baseUrl?: string } = {},
+  options: {
+    dataDir?: string;
+    demo?: boolean;
+    baseUrl?: string;
+    /** Bind address; any non-loopback address requires a one-time setup code. */
+    host?: string;
+    /** Proxy addresses whose X-Forwarded-For is believed (Fastify trustProxy). */
+    trustProxy?: string;
+  } = {},
 ) {
-  const app = Fastify({ logger: false, bodyLimit: 16384, trustProxy: false });
+  const app = Fastify({
+    logger: false,
+    bodyLimit: 16384,
+    trustProxy: options.trustProxy || false,
+  });
   const baseUrl = (options.baseUrl || "http://localhost:4318").replace(
     /\/$/,
     "",
@@ -23,6 +62,8 @@ export async function buildApp(
     throw new Error("Base URL must be HTTP(S).");
   const config = new Configuration(options.dataDir, options.demo);
   const unlock = await lockVault(config.dir);
+  // Holding the lock, no other process can own an interrupted temporary file.
+  sweepTemporary(config.dir);
   const archive = new Archive(config.dir);
   await seedDemo(config, archive);
   const clip = new Clip(config, archive);
@@ -32,8 +73,56 @@ export async function buildApp(
     string,
     { label: string; session: string; expires: number }
   >();
-  const attempts = new Map<string, { n: number; until: number }>();
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  const throttle = new Throttle();
+  // Before setup, anyone who can reach the server could claim it. When it is reachable
+  // beyond loopback, setup needs a one-time code printed to the server log.
+  let code =
+    !config.value.password &&
+    (!loopbackHost(options.host) || !LOOPBACK_NAMES.has(expected.hostname))
+      ? setupCode()
+      : "";
+  const aliases = new Set(
+    LOOPBACK_NAMES.has(expected.hostname)
+      ? [...LOOPBACK_NAMES].map((name) => name + ":" + expected.port)
+      : [expected.hostname + ":" + expected.port],
+  );
+  const allowedHost = (value: string) => {
+    const a = authority(expected.protocol, value);
+    return !!a && aliases.has(a);
+  };
+  const allowedOrigin = (value: string) => {
+    try {
+      const u = new URL(value);
+      return (
+        u.origin === value &&
+        u.protocol === expected.protocol &&
+        allowedHost(u.host)
+      );
+    } catch {
+      return false;
+    }
+  };
+  // Password checks share one bounded backoff; never a long lockout of the owner.
+  const guarded = (r: FastifyRequest, reply: any) => {
+    const wait = Math.ceil(throttle.check(r.ip) / 1000);
+    if (!wait) return false;
+    reply
+      .code(429)
+      .header("Retry-After", String(wait))
+      .send({
+        error:
+          "Too many password attempts. Wait " +
+          (wait === 1 ? "1 second" : wait + " seconds") +
+          ", then try again.",
+      });
+    return true;
+  };
+  const same = (a: string, b: string) => {
+    const x = Buffer.from(a);
+    const y = Buffer.from(b);
+    return x.length === y.length && timingSafeEqual(x, y);
+  };
+  let timer: ReturnType<typeof setInterval> | undefined;
   const cookie = (r: FastifyRequest) =>
     r.headers.cookie
       ?.split(";")
@@ -53,38 +142,28 @@ export async function buildApp(
     );
     return id;
   };
-  const schedule = () => {
-    if (timer) clearTimeout(timer);
+  // A periodic due-check (not one long timer) survives restarts, settings changes and
+  // intervals beyond setTimeout's 24.8-day ceiling.
+  const tick = () => {
     if (
-      config.value.scheduleHours &&
-      !config.value.demo &&
-      config.value.password
-    ) {
-      timer = setTimeout(() => {
-        if (!sync.active && config.value.accounts.some((a) => a.token))
-          sync.start();
-        schedule();
-      }, config.value.scheduleHours * 3600000);
-      timer.unref();
+      sync.active ||
+      config.value.demo ||
+      !config.value.password ||
+      !config.value.accounts.some((a) => a.token) ||
+      !backupDue(sync.lastBackup, config.value.scheduleHours)
+    )
+      return;
+    try {
+      sync.start();
+    } catch {
+      // Progress records the reason; the next tick retries after the interval.
     }
   };
+  const schedule = () => {
+    if (!timer) timer = setInterval(tick, 10 * 60000).unref();
+  };
   app.addHook("onRequest", async (r, reply) => {
-    const host = r.headers.host || "";
-    const allowed = new Set([
-      expected.host,
-      ...(expected.hostname === "localhost" || expected.hostname === "127.0.0.1"
-        ? [
-            "localhost:" + expected.port,
-            "127.0.0.1:" + expected.port,
-            "[::1]:" + expected.port,
-          ]
-        : []),
-    ]);
-    if (
-      r.url !== "/health" &&
-      !allowed.has(host) &&
-      !(host === "localhost" && expected.port === "")
-    )
+    if (r.url !== "/health" && !allowedHost(r.headers.host || ""))
       return reply.code(403).send({
         error:
           "Host not allowed. Set VAULT_BASE_URL to the exact URL you use to open the app.",
@@ -104,7 +183,8 @@ export async function buildApp(
         return reply
           .code(403)
           .send({ error: "Request protection missing. Reload the app." });
-      if (r.headers.origin && r.headers.origin !== expected.origin)
+      // The same loopback aliases the Host check accepts, and nothing else.
+      if (r.headers.origin !== undefined && !allowedOrigin(r.headers.origin))
         return reply
           .code(403)
           .send({ error: "Cross-origin writes are not allowed." });
@@ -123,7 +203,7 @@ export async function buildApp(
   app.setErrorHandler((error, r, reply) => {
     const message = error instanceof Error ? error.message : "Request failed.";
     const safe =
-      /^(Use |Choose |Enter |Unknown |The start date|Image |This image|Tumblr |Save your|Reconnect |Backup |A backup|Demo mode|Setup |Local |Invalid |Source record)/.test(
+      /^(Use |Choose |Enter |Unknown |The start date|Image |This image|Tumblr |Save your|Reconnect |Backup |A backup|Demo mode|Setup |Local |The local CLIP |Invalid |Source record)/.test(
         message,
       );
     reply
@@ -147,39 +227,53 @@ export async function buildApp(
   }));
   app.get("/api/setup", async (r) => {
     const s = config.public(baseUrl);
-    return !s.configured || authenticated(r)
-      ? s
-      : { ...s, dataDir: "", storageFree: 0, profiles: [], mlUrl: "" };
+    return !s.configured
+      ? { ...s, setupCodeRequired: !!code }
+      : authenticated(r)
+        ? s
+        : { ...s, dataDir: "", storageFree: 0, profiles: [], mlUrl: "" };
   });
   app.post<{ Body: Record<string, unknown> }>(
     "/api/setup",
     async (r, reply) => {
+      if (code) {
+        if (guarded(r, reply)) return reply;
+        if (
+          !same(
+            String(r.body?.setupCode || "")
+              .trim()
+              .toUpperCase(),
+            code,
+          )
+        ) {
+          throttle.fail(r.ip);
+          return reply.code(403).send({
+            error:
+              "Enter the setup code shown in the Tumblr Vault server log (for Docker: docker compose logs).",
+          });
+        }
+      }
+      // configure() rechecks synchronously: a concurrent loser gets 409 and no session.
       config.configure(r.body, true);
+      code = "";
+      throttle.succeed(r.ip);
       newSession(reply);
       schedule();
       return config.public(baseUrl);
     },
   );
   app.post<{ Body: { password?: string } }>("/api/login", async (r, reply) => {
-    const key = r.ip;
-    let a = attempts.get(key);
-    if (a && a.until > Date.now() && a.n >= 10)
-      return reply
-        .code(429)
-        .send({ error: "Too many unlock attempts. Try again in 15 minutes." });
-    if (!a || a.until < Date.now()) {
-      a = { n: 0, until: Date.now() + 900000 };
-      attempts.set(key, a);
-    }
-    a.n++;
+    if (guarded(r, reply)) return reply;
     if (
       !config.value.password ||
       !checkPassword(String(r.body?.password || ""), config.value.password)
-    )
+    ) {
+      throttle.fail(r.ip);
       return reply
         .code(401)
         .send({ error: "That password did not unlock the vault." });
-    attempts.delete(key);
+    }
+    throttle.succeed(r.ip);
     newSession(reply);
     return { ok: true };
   });
@@ -199,6 +293,22 @@ export async function buildApp(
         throw new Error(
           "A backup or indexing run is already in progress. Wait before changing settings.",
         );
+      // A session alone cannot replace the password; the current one is required.
+      if (r.body.password) {
+        if (guarded(r, reply)) return reply;
+        if (
+          !checkPassword(
+            String(r.body.currentPassword || ""),
+            config.value.password!,
+          )
+        ) {
+          throttle.fail(r.ip);
+          return reply.code(403).send({
+            error: "Enter your current vault password to set a new one.",
+          });
+        }
+        throttle.succeed(r.ip);
+      }
       config.configure(r.body);
       if (r.body.password) {
         sessions.clear();
@@ -231,7 +341,13 @@ export async function buildApp(
       const state = r.query.state || "";
       const p = pending.get(state);
       pending.delete(state); // SameSite=Strict cookies may be absent on the cross-site callback; state is the one-use bearer.
-      if (!p || p.expires < Date.now() || !sessions.has(p.session))
+      const session = p && sessions.get(p.session);
+      if (
+        !p ||
+        p.expires < Date.now() ||
+        !session ||
+        session.expires <= Date.now()
+      )
         return reply
           .code(400)
           .type("text/plain")
@@ -319,7 +435,7 @@ export async function buildApp(
           )
           .header(
             "Content-Disposition",
-            'attachment; filename="' + r.params.id + '"',
+            'attachment; filename="' + String(m!.id) + '"',
           );
       return reply.send(createReadStream(join(dir, name)));
     },
@@ -358,11 +474,21 @@ export async function buildApp(
   }
   schedule();
   app.addHook("onClose", async () => {
-    if (timer) clearTimeout(timer);
-    await sync.active;
+    if (timer) clearInterval(timer);
+    await sync.stop();
     archive.close();
     await unlock();
   });
-  app.decorate("vault", { config, archive, sync, clip });
+  app.decorate("vault", {
+    config,
+    archive,
+    sync,
+    clip,
+    throttle,
+    sessions,
+    get setupCode() {
+      return code;
+    },
+  });
   return app;
 }

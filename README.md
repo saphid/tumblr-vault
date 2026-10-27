@@ -34,7 +34,7 @@ No Python. No database service. No cloud subscription. The app, CLI and UI are T
 **With npm** — install [Node.js 24+](https://nodejs.org/), then:
 
 ```sh
-npm install --global https://github.com/saphid/tumblr-vault/releases/download/v1.0.0/tumblr-vault-1.0.0.tgz
+npm install --global https://github.com/saphid/tumblr-vault/releases/download/v1.0.1/tumblr-vault-1.0.1.tgz
 tumblr-vault
 ```
 
@@ -72,13 +72,13 @@ Posts keep their context. Likes and reblogs keep their actions. Shared pictures 
 
 ## Private by default
 
-Vault binds to loopback. A local password protects the shared app. Use HTTPS through Tailscale Serve to reach it on your other devices. Tokens live in your private data directory, and remote post content is rendered as text. There is no telemetry or hosted account.
+Vault binds to loopback. A local password protects the shared app. If Vault is reachable beyond this device before setup (Docker, `--host 0.0.0.0` or an HTTPS base URL), the wizard also asks for a one-time setup code printed in the server log, so nobody else can claim it first. Use HTTPS through Tailscale Serve to reach it on your other devices. Tokens live in your private data directory, and remote post content is rendered as text. There is no telemetry or hosted account.
 
 Profiles organize content; anyone with the vault password can access every profile. Keep the whole data directory backed up on another drive. [Security and privacy details →](SECURITY.md)
 
 ## What to expect
 
-The first backup can take hours or days because Tumblr limits API access. Local CLIP downloads its model on first use and needs about 1 GB disk and 2 GB available RAM. Text search works without it. Schedules run while the app is running.
+The first backup can take hours or days because Tumblr limits API access. If one connected account fails, the others still back up and the run reports exactly which account needs attention. Local CLIP downloads its model on first use and needs about 1 GB disk and 2 GB available RAM. Its ONNX runtime is an optional dependency: if your platform cannot install it, Vault still installs with text search and Immich support, and Settings explains how to add it. Text search works without it. Schedules run while the app is running.
 
 An API backup cannot guarantee deleted/restricted posts, drafts, queues, messages, all old likes or externally hosted embeds. Unavailable downloads are reported honestly. OCR, upload-to-search and official-export ZIP import are future work. [Verified behavior and limits →](docs/VERIFICATION.md)
 

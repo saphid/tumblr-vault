@@ -13,6 +13,12 @@ export function validateToken(t: Token) {
       "Tumblr must grant exactly basic offline_access (read-only, renewable access).",
     );
 }
+// Accepts a numeric string as well as a number; anything else fails validation.
+function expiry(value: unknown) {
+  return typeof value === "string" && /^\d+$/.test(value)
+    ? Number(value)
+    : value;
+}
 export function rateDelay(h: Headers) {
   const values = [60];
   const retry = h.get("retry-after");
@@ -32,6 +38,13 @@ export function rateDelay(h: Headers) {
 }
 export class Tumblr {
   private refreshes = new Map<string, Promise<string>>();
+  // Set by the backup worker so shutdown interrupts in-flight reads.
+  signal?: AbortSignal;
+  private deadline(ms = 45000) {
+    return this.signal
+      ? AbortSignal.any([AbortSignal.timeout(ms), this.signal])
+      : AbortSignal.timeout(ms);
+  }
   constructor(
     readonly config: Configuration,
     readonly wait: (seconds: number) => Promise<void> = (seconds) =>
@@ -71,7 +84,11 @@ export class Tumblr {
           "). Check your app credentials and callback URL.",
       );
     const raw = (await r.json()) as any;
-    const token = { ...raw, obtained: Date.now() };
+    const token = {
+      ...raw,
+      expires_in: expiry(raw?.expires_in),
+      obtained: Date.now(),
+    };
     validateToken(token);
     return token;
   }
@@ -79,6 +96,7 @@ export class Tumblr {
     if (!account.token) throw new Error("Reconnect this account in Settings.");
     if (
       !force &&
+      account.token.access_token &&
       Date.now() <
         account.token.obtained + account.token.expires_in * 1000 - 120000
     )
@@ -97,7 +115,7 @@ export class Tumblr {
             client_secret: c.clientSecret!,
           }),
           redirect: "error",
-          signal: AbortSignal.timeout(45000),
+          signal: this.deadline(),
         });
         if (!r.ok)
           throw new Error(
@@ -106,11 +124,35 @@ export class Tumblr {
         const raw = (await r.json()) as any;
         const token = {
           ...raw,
-          refresh_token: raw.refresh_token || previous.refresh_token,
-          scope: raw.scope || previous.scope,
+          refresh_token: raw?.refresh_token || previous.refresh_token,
+          scope: raw?.scope || previous.scope,
+          expires_in: expiry(raw?.expires_in),
           obtained: Date.now(),
         };
-        validateToken(token);
+        try {
+          validateToken(token);
+        } catch (error) {
+          // Tumblr may already have retired the old refresh token. Keep the rotated one so
+          // the account can recover, but never keep or use the refused access token:
+          // the stored access is cleared and marked expired, so every later call refreshes.
+          if (
+            typeof raw?.refresh_token === "string" &&
+            raw.refresh_token &&
+            raw.refresh_token !== previous.refresh_token
+          ) {
+            account.token = {
+              ...previous,
+              access_token: "",
+              refresh_token: raw.refresh_token,
+              obtained: 0,
+            };
+            this.config.save();
+          } else if (previous.access_token) {
+            account.token = { ...previous, access_token: "", obtained: 0 };
+            this.config.save();
+          }
+          throw error;
+        }
         account.token = token;
         this.config.save();
         return token.access_token;
@@ -137,7 +179,7 @@ export class Tumblr {
             "Bearer " + (await this.access(account, attempt === 1)),
         },
         redirect: "error",
-        signal: AbortSignal.timeout(45000),
+        signal: this.deadline(),
       });
       if (r.status === 401 && attempt === 0) continue;
       if (r.status === 429 && rates++ < 3) {

@@ -1,7 +1,7 @@
 // A real fresh npm install of the distributable, independent of this checkout's dependencies.
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createServer } from "node:net";
@@ -39,6 +39,12 @@ assert(
     encoding: "utf8",
   }).includes("Tumblr Vault"),
 );
+assert.equal(
+  execFileSync(process.execPath, [cli, "--version"], {
+    encoding: "utf8",
+  }).trim(),
+  JSON.parse(readFileSync("package.json", "utf8")).version,
+);
 const port = await new Promise<number>((res) => {
   const s = createServer();
   s.listen(0, "127.0.0.1", () => {
@@ -50,10 +56,11 @@ const base = "http://localhost:" + port;
 const data = join(dir, "vault-data");
 let child: ChildProcess | undefined;
 let log = "";
-async function start() {
+async function start(extra: string[] = [], dir = data) {
+  log = "";
   child = spawn(
     process.execPath,
-    [cli, "--demo", "--data-dir", data, "--port", String(port)],
+    [cli, "--demo", "--data-dir", dir, "--port", String(port), ...extra],
     { stdio: ["ignore", "pipe", "pipe"] },
   );
   child.stdout?.on("data", (b) => (log += b));
@@ -114,8 +121,55 @@ try {
   ).json()) as any;
   assert.equal(search.total, 8);
   assert(JSON.parse(readFileSync(join(data, "config.json"), "utf8")).password);
+  await stop();
+  // A text-only install: the optional local CLIP runtime is absent (npm skips an optional
+  // dependency that cannot install). Text search works and the UI explains the option.
+  const runtime = join(
+    packageDir,
+    "node_modules",
+    "@huggingface",
+    "transformers",
+  );
+  assert(existsSync(runtime), "optional runtime installed by default");
+  rmSync(runtime, { recursive: true, force: true });
+  await start();
+  const write = {
+    "Content-Type": "application/json",
+    "x-vault-request": "1",
+    Origin: base,
+  };
+  const unlock = await fetch(base + "/api/login", {
+    method: "POST",
+    headers: write,
+    body: JSON.stringify({ password: "synthetic-install-password" }),
+  });
+  cookie = unlock.headers.get("set-cookie")!.split(";")[0];
+  const settings = (await (
+    await fetch(base + "/api/settings", { headers: { cookie } })
+  ).json()) as any;
+  assert.equal(settings.localClipAvailable, false);
+  const local = await fetch(base + "/api/settings", {
+    method: "POST",
+    headers: { ...write, cookie },
+    body: JSON.stringify({ clip: "local" }),
+  });
+  assert.equal(local.status, 400);
+  assert.match(((await local.json()) as any).error, /--include=optional/);
+  search = (await (
+    await fetch(base + "/api/search?q=quiet", { headers: { cookie } })
+  ).json()) as any;
+  assert(search.total > 0);
+  await stop();
+  // Reachable beyond loopback: the CLI prints a one-time setup code and setup needs it.
+  const exposed = join(dir, "exposed-data");
+  await start(["--base-url", "https://vault.example.test"], exposed);
+  for (let i = 0; i < 50 && !log.includes("setup code"); i++)
+    await new Promise((r) => setTimeout(r, 100));
+  const code = /One-time setup code: ([A-Z2-9-]+)/.exec(log)?.[1];
+  assert(code, log);
+  assert(log.includes("https://vault.example.test/#setup=" + code));
   console.log(
-    "PASS: fresh npm install, executable help, bundled UI, wizard setup, BM25 query, restart, locked session and persisted 8-entry archive.",
+    "PASS: fresh npm install, executable help/version, bundled UI, wizard setup, BM25 query, restart, locked session, persisted 8-entry archive, text-only install without the optional CLIP runtime, and the exposed setup code.",
   );
 } finally {
   await stop();

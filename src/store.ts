@@ -1,7 +1,8 @@
 import { DatabaseSync, backup } from "node:sqlite";
 import { join } from "node:path";
 import { renameSync, chmodSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { syncDirectory } from "./durable.js";
+import { createHash, randomBytes } from "node:crypto";
 import type {
   Detail,
   Entry,
@@ -12,6 +13,7 @@ import type {
   Profile,
 } from "./contract.js";
 export type Raw = Record<string, any>;
+type Facets = { blogs: string[]; types: string[] };
 export function plain(value: unknown): string {
   return String(value ?? "")
     .replace(/<[^>]*>/g, " ")
@@ -90,8 +92,12 @@ export function extract(post: Raw) {
     groupId: String(lineage),
   };
 }
+// Bump with each migration in migrate(); opening never downgrades a newer schema.
+export const SCHEMA_VERSION = 1;
 export class Archive {
   readonly db: DatabaseSync;
+  private generation = 0;
+  private facetCache = new Map<string, { at: number; value: Facets }>();
   constructor(readonly dir: string) {
     this.db = new DatabaseSync(join(dir, "archive.sqlite"));
     this.db
@@ -104,13 +110,81 @@ export class Archive {
  CREATE TABLE IF NOT EXISTS post_media(post TEXT NOT NULL REFERENCES posts(id),media INTEGER NOT NULL REFERENCES media(id),position INTEGER,PRIMARY KEY(post,media)); CREATE INDEX IF NOT EXISTS media_posts ON post_media(media,post);
  CREATE TABLE IF NOT EXISTS checkpoints(key TEXT PRIMARY KEY,value TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+    this.migrate();
+  }
+  // Version 1 (1.0.1): FTS rows are keyed by a stable rowid recorded in fts_doc, so an
+  // update deletes by rowid instead of scanning the UNINDEXED id column; previews record
+  // failures; media hashes are indexed for deduplicated indexing. Existing rows are kept.
+  private migrate() {
+    const version = Number(
+      this.db.prepare("PRAGMA user_version").get()!.user_version,
+    );
+    if (version > SCHEMA_VERSION)
+      throw new Error(
+        "This vault was created by a newer Tumblr Vault. Upgrade the app to open it.",
+      );
+    if (version < 1)
+      this.transaction(() => {
+        const columns = this.db
+          .prepare("PRAGMA table_info(media)")
+          .all()
+          .map((c) => c.name);
+        if (!columns.includes("thumb_error"))
+          this.db.exec("ALTER TABLE media ADD COLUMN thumb_error TEXT");
+        this.db.exec(
+          "CREATE TABLE IF NOT EXISTS fts_doc(post TEXT PRIMARY KEY,doc INTEGER NOT NULL UNIQUE); CREATE INDEX IF NOT EXISTS media_hash ON media(hash); PRAGMA user_version=1",
+        );
+      });
+    this.reconcileSearchIndex();
+  }
+  // Validate associations once on open, not per ingest. Older interrupted writes can
+  // reuse a deleted rowid without changing either the count or maximum rowid.
+  private reconcileSearchIndex() {
+    const fts = this.db
+      .prepare("SELECT COUNT(*) n,COALESCE(MAX(id),0) top FROM fts_docsize")
+      .get()!;
+    const docs = this.db
+      .prepare("SELECT COUNT(*) n,COALESCE(MAX(doc),0) top FROM fts_doc")
+      .get()!;
+    if (
+      fts.n === docs.n &&
+      fts.top === docs.top &&
+      !this.db
+        .prepare(
+          "SELECT 1 FROM fts_doc d LEFT JOIN fts f ON f.rowid=d.doc WHERE f.id IS NULL OR f.id!=d.post LIMIT 1",
+        )
+        .get()
+    )
+      return;
+    this.transaction(() => {
+      this.db.exec("DELETE FROM fts_doc");
+      this.db.exec(
+        "DELETE FROM fts WHERE rowid NOT IN (SELECT MAX(rowid) FROM fts GROUP BY id)",
+      );
+      this.db.exec(
+        "INSERT INTO fts_doc(post,doc) SELECT id,rowid FROM fts WHERE id IS NOT NULL",
+      );
+    });
+  }
+  // Nested calls join the outer transaction, so a page of records commits once.
+  transaction<T>(work: () => T): T {
+    const name = "s" + randomBytes(4).toString("hex");
+    this.db.exec("SAVEPOINT " + name);
+    try {
+      const result = work();
+      this.db.exec("RELEASE " + name);
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO " + name);
+      this.db.exec("RELEASE " + name);
+      throw error;
+    }
   }
   ingest(account: string, role: string, post: Raw) {
     const id = String(post.id_string || post.id);
     if (!id || id === "undefined") throw new Error("Source record has no ID.");
     const e = extract(post);
-    this.db.exec("BEGIN");
-    try {
+    this.transaction(() => {
       this.db
         .prepare(
           "INSERT INTO posts VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET group_id=excluded.group_id,blog=excluded.blog,timestamp=excluded.timestamp,type=excluded.type,title=excluded.title,body=excluded.body,tags=excluded.tags,url=excluded.url,raw=excluded.raw",
@@ -127,10 +201,18 @@ export class Archive {
           post.post_url || "",
           JSON.stringify(post),
         );
-      this.db.prepare("DELETE FROM fts WHERE id=?").run(id);
-      this.db
-        .prepare("INSERT INTO fts VALUES(?,?,?,?)")
-        .run(id, e.title, (post.tags || []).join(" "), e.text);
+      const doc = this.db
+        .prepare("SELECT doc FROM fts_doc WHERE post=?")
+        .get(id)?.doc as number | undefined;
+      if (doc !== undefined)
+        this.db.prepare("DELETE FROM fts WHERE rowid=?").run(doc);
+      const inserted = this.db
+        .prepare("INSERT INTO fts(rowid,id,title,tags,body) VALUES(?,?,?,?,?)")
+        .run(doc ?? null, id, e.title, (post.tags || []).join(" "), e.text);
+      if (doc === undefined)
+        this.db
+          .prepare("INSERT INTO fts_doc(post,doc) VALUES(?,?)")
+          .run(id, inserted.lastInsertRowid);
       this.db
         .prepare("INSERT OR REPLACE INTO membership VALUES(?,?,?,?)")
         .run(account, id, role, post.liked_timestamp || null);
@@ -146,11 +228,8 @@ export class Archive {
           .prepare("INSERT INTO post_media VALUES(?,?,?)")
           .run(id, row.id as number, i);
       });
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
+    this.generation++;
     return id;
   }
   state(key: string, value?: unknown): any {
@@ -175,62 +254,101 @@ export class Archive {
     return this.db.prepare("SELECT * FROM media WHERE id=?").get(id);
   }
   mediaFor(id: string): Media[] {
-    return (
-      this.db
-        .prepare(
-          "SELECT m.* FROM media m JOIN post_media pm ON pm.media=m.id WHERE pm.post=? ORDER BY pm.position",
-        )
-        .all(id) as Raw[]
-    ).map((m) => ({
-      id: m.id,
-      kind: m.kind,
-      thumb: !!m.thumb,
-      saved: !!m.path,
-      bytes: m.bytes,
-      error: m.error || undefined,
-    }));
+    return this.mediaForPosts([id]).get(id) || [];
+  }
+  private mediaForPosts(ids: string[]) {
+    const out = new Map<string, Media[]>();
+    for (const m of this.db
+      .prepare(
+        "SELECT pm.post,m.id,m.kind,m.thumb,m.path,m.bytes,m.error,m.thumb_error FROM post_media pm JOIN media m ON m.id=pm.media WHERE pm.post IN (SELECT value FROM json_each(?)) ORDER BY pm.post,pm.position",
+      )
+      .iterate(JSON.stringify(ids)) as Iterable<Raw>) {
+      const list = out.get(m.post) || [];
+      list.push({
+        id: m.id,
+        kind: m.kind,
+        thumb: !!m.thumb,
+        saved: !!m.path,
+        bytes: m.bytes,
+        error: m.error || undefined,
+        previewError: m.thumb_error || undefined,
+      });
+      out.set(m.post, list);
+    }
+    return out;
   }
   private scope(profile: string) {
     return profile ? "AND account=?" : "";
   }
-  private entry(row: Raw, profile = ""): Entry {
-    const versions = this.db
+  // Saved versions of the given lineages, with their actions, in a fixed number of queries.
+  private versions(groups: string[], profile = "") {
+    const rows = this.db
       .prepare(
-        `SELECT DISTINCT p.* FROM posts p JOIN membership m ON m.post=p.id WHERE p.group_id=? ${profile ? "AND m.account=?" : ""}`,
+        `SELECT DISTINCT p.id,p.group_id,p.blog,p.timestamp,p.tags,CASE WHEN json_extract(p.raw,'$.reblogged_root_id') IS NULL OR json_extract(p.raw,'$.reblogged_root_id') IN ('',0) THEN 0 ELSE 1 END reblog FROM posts p JOIN membership m ON m.post=p.id WHERE p.group_id IN (SELECT value FROM json_each(?)) ${profile ? "AND m.account=?" : ""} ORDER BY p.timestamp DESC,p.id DESC`,
       )
-      .all(...[row.group_id, ...(profile ? [profile] : [])]) as Raw[];
-    const ids = versions.map((p) => p.id);
-    const actions = new Set<string>();
-    for (const id of ids)
-      for (const m of this.db
-        .prepare(
-          `SELECT role FROM membership WHERE post=? ${this.scope(profile)}`,
-        )
-        .all(...[id, ...(profile ? [profile] : [])]))
-        actions.add(
-          m.role === "like"
-            ? "Liked"
-            : m.role === "post"
-              ? JSON.parse(String(versions.find((p) => p.id === id)!.raw))
-                  .reblogged_root_id
-                ? "Reblogged"
-                : "Posted"
-              : String(m.role),
-        );
-    return {
-      id: row.id,
-      groupId: row.group_id,
-      blog: row.blog,
-      title: row.title,
-      text: row.body,
-      timestamp: row.timestamp,
-      type: row.type,
-      tags: [...new Set<string>(versions.flatMap((p) => JSON.parse(p.tags)))],
-      actions: [...actions],
-      media: this.mediaFor(row.id),
-      versions: ids.length,
-      score: row.score,
-    };
+      .all(JSON.stringify(groups), ...(profile ? [profile] : [])) as Raw[];
+    const roles = new Map<string, string[]>();
+    for (const m of this.db
+      .prepare(
+        `SELECT post,role FROM membership WHERE post IN (SELECT value FROM json_each(?)) ${this.scope(profile)} ORDER BY post,role`,
+      )
+      .iterate(
+        JSON.stringify(rows.map((r) => r.id)),
+        ...(profile ? [profile] : []),
+      ) as Iterable<Raw>)
+      roles.set(m.post, [...(roles.get(m.post) || []), String(m.role)]);
+    const byGroup = new Map<string, Raw[]>();
+    for (const r of rows) {
+      r.actions = (roles.get(r.id) || []).map((role) =>
+        role === "like"
+          ? "Liked"
+          : role === "post"
+            ? r.reblog
+              ? "Reblogged"
+              : "Posted"
+            : role,
+      );
+      byGroup.set(r.group_id, [...(byGroup.get(r.group_id) || []), r]);
+    }
+    return byGroup;
+  }
+  // Only the selected page is loaded in full; ranking and grouping use compact columns.
+  private entries(ids: string[], scores: Map<string, number>, profile = "") {
+    if (!ids.length) return [];
+    const rows = new Map(
+      (
+        this.db
+          .prepare(
+            "SELECT id,group_id,blog,title,body,timestamp,type FROM posts WHERE id IN (SELECT value FROM json_each(?))",
+          )
+          .all(JSON.stringify(ids)) as Raw[]
+      ).map((r) => [r.id, r]),
+    );
+    const versions = this.versions(
+      [...new Set([...rows.values()].map((r) => r.group_id))],
+      profile,
+    );
+    const media = this.mediaForPosts(ids);
+    return ids
+      .filter((id) => rows.has(id))
+      .map((id): Entry => {
+        const row = rows.get(id)!;
+        const group = versions.get(row.group_id) || [];
+        return {
+          id: row.id,
+          groupId: row.group_id,
+          blog: row.blog,
+          title: row.title,
+          text: row.body,
+          timestamp: row.timestamp,
+          type: row.type,
+          tags: [...new Set<string>(group.flatMap((p) => JSON.parse(p.tags)))],
+          actions: [...new Set<string>(group.flatMap((p) => p.actions))],
+          media: media.get(id) || [],
+          versions: group.length,
+          score: scores.get(id),
+        };
+      });
   }
   filter(params: Record<string, string>) {
     const where: string[] = ["1=1"];
@@ -292,9 +410,10 @@ export class Archive {
     const { where, binds } = this.filter(params);
     let from = "posts p";
     let condition = where;
-    let select = "p.*";
+    let score = "NULL";
     const q = (params.q || "").trim().slice(0, 1000);
-    if (q && params.mode !== "image" && !params.similar) {
+    const text = !!q && params.mode !== "image" && !params.similar;
+    if (text) {
       const words = q.match(/[\p{L}\p{N}_]+/gu) || [];
       if (!words.length)
         return {
@@ -312,59 +431,69 @@ export class Archive {
       from += " JOIN fts ON fts.id=p.id";
       condition += " AND fts MATCH ?";
       binds.push(expression);
-      select += ",bm25(fts,0,5,3,1) score";
+      score = "bm25(fts,0,5,3,1)";
     }
-    // Ranking happens per saved version before grouping, then count/pagination.
-    const rows = this.db
-      .prepare(`SELECT ${select} FROM ${from} WHERE ${condition}`)
-      .all(...binds) as Raw[];
-    const filtered: Raw[] = ranking
-      ? rows
-          .filter((r) => ranking.has(r.id))
-          .map((r) => ({ ...r, score: ranking.get(r.id) }))
-      : rows;
-    const relevant = (a: Raw, b: Raw) =>
-      ranking
-        ? (b.score ?? 0) - (a.score ?? 0)
-        : (a.score ?? 0) - (b.score ?? 0);
-    filtered.sort((a, b) =>
+    if (ranking) {
+      from += " JOIN json_each(?) r ON r.key=p.id";
+      binds.unshift(JSON.stringify(Object.fromEntries(ranking)));
+      score = "r.value";
+    }
+    // Rank each saved version, keep the best version per lineage, then count and page.
+    const order =
       params.sort === "oldest"
-        ? a.timestamp - b.timestamp || a.id.localeCompare(b.id)
+        ? "timestamp ASC,id ASC"
         : params.sort === "newest"
-          ? b.timestamp - a.timestamp || b.id.localeCompare(a.id)
-          : relevant(a, b) ||
-            b.timestamp - a.timestamp ||
-            b.id.localeCompare(a.id),
+          ? "timestamp DESC,id DESC"
+          : ranking
+            ? "score DESC,timestamp DESC,id DESC"
+            : text
+              ? "score ASC,timestamp DESC,id DESC"
+              : "timestamp DESC,id DESC";
+    const candidates = `WITH c AS (SELECT p.id id,p.group_id group_id,p.timestamp timestamp,${score} score FROM ${from} WHERE ${condition})`;
+    const total = Number(
+      this.db
+        .prepare(`${candidates} SELECT COUNT(DISTINCT group_id) n FROM c`)
+        .get(...binds)!.n,
     );
-    const groups = new Map<string, Raw>();
-    for (const r of filtered)
-      if (!groups.has(r.group_id)) groups.set(r.group_id, r);
-    const all = [...groups.values()];
-    const pages = Math.ceil(all.length / 24);
+    const pages = Math.ceil(total / 24);
     const page = Math.min(
       Math.max(1, Number.parseInt(params.page || "1") || 1),
       Math.max(1, pages),
     );
+    const rows = this.db
+      .prepare(
+        `${candidates}, g AS (SELECT c.*,ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY ${order}) rn FROM c) SELECT id,score FROM g WHERE rn=1 ORDER BY ${order} LIMIT 24 OFFSET ?`,
+      )
+      .all(...binds, (page - 1) * 24) as Raw[];
+    const scores = new Map<string, number>();
+    for (const r of rows) if (r.score !== null) scores.set(r.id, r.score);
     return {
-      entries: all
-        .slice((page - 1) * 24, page * 24)
-        .map((r) => this.entry(r, params.profile)),
-      total: all.length,
+      entries: this.entries(
+        rows.map((r) => r.id),
+        scores,
+        params.profile,
+      ),
+      total,
       page,
       pages,
       ...this.facets(params.profile),
     };
   }
-  facets(profile = "") {
+  // Facets change only on ingest; reuse them between searches in this process.
+  facets(profile = ""): Facets {
+    const cached = this.facetCache.get(profile);
+    if (cached?.at === this.generation) return cached.value;
     const rows = this.db
       .prepare(
         `SELECT DISTINCT p.blog,p.type FROM posts p JOIN membership m ON m.post=p.id ${profile ? "WHERE m.account=?" : ""}`,
       )
       .all(...(profile ? [profile] : [])) as Raw[];
-    return {
+    const value = {
       blogs: [...new Set<string>(rows.map((r) => r.blog))].sort(),
       types: [...new Set<string>(rows.map((r) => r.type))].sort(),
     };
+    this.facetCache.set(profile, { at: this.generation, value });
+    return value;
   }
   detail(id: string, profile = ""): Detail | undefined {
     const row = this.db
@@ -375,16 +504,12 @@ export class Archive {
     if (!row) return;
     const raw = JSON.parse(row.raw);
     const savedVersions = (
-      this.db
-        .prepare(
-          `SELECT DISTINCT p.* FROM posts p JOIN membership m ON p.id=m.post WHERE p.group_id=? ${profile ? "AND m.account=?" : ""} ORDER BY timestamp DESC`,
-        )
-        .all(...[row.group_id, ...(profile ? [profile] : [])]) as Raw[]
+      this.versions([row.group_id], profile).get(row.group_id) || []
     ).map((r) => ({
       id: r.id,
       blog: r.blog,
       timestamp: r.timestamp,
-      actions: this.entry(r, profile).actions,
+      actions: r.actions,
     }));
     const blocks = (raw.trail || []).map((t: Raw) => ({
       author: t.blog?.name || "Unavailable author",
@@ -396,7 +521,7 @@ export class Archive {
         text: extract({ content: raw.content }).text,
       });
     return {
-      ...this.entry(row, profile),
+      ...this.entries([row.id], new Map(), profile)[0],
       raw,
       url: row.url,
       blocks,
@@ -413,7 +538,7 @@ export class Archive {
       .get(...p)!;
     const m = this.db
       .prepare(
-        `SELECT COUNT(*) media,COALESCE(SUM(path IS NOT NULL),0) saved,COALESCE(SUM(error IS NOT NULL),0) unavailable,COALESCE(SUM(embedding IS NOT NULL),0) indexed_count,COALESCE(SUM(bytes),0) bytes FROM media WHERE id IN (SELECT media FROM post_media WHERE post IN (${postScope}))`,
+        `SELECT COUNT(*) media,COALESCE(SUM(path IS NOT NULL),0) saved,COALESCE(SUM(error IS NOT NULL),0) unavailable,COALESCE(SUM(embedding IS NOT NULL),0) indexed_count,COALESCE(SUM(thumb_error IS NOT NULL),0) previews,COALESCE(SUM(bytes),0) bytes FROM media WHERE id IN (SELECT media FROM post_media WHERE post IN (${postScope}))`,
       )
       .get(...p)!;
     return {
@@ -424,6 +549,7 @@ export class Archive {
       saved: Number(m.saved),
       unavailable: Number(m.unavailable),
       indexed: Number(m.indexed_count),
+      previewsFailed: Number(m.previews),
       bytes: Number(m.bytes),
       progress,
     };
@@ -433,6 +559,7 @@ export class Archive {
     await backup(this.db, path + ".pending");
     chmodSync(path + ".pending", 0o600);
     renameSync(path + ".pending", path);
+    syncDirectory(join(this.dir, "exports"));
     return path;
   }
   close() {

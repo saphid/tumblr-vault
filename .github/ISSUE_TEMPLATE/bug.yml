@@ -11,7 +11,7 @@ body:
     id: version
     attributes:
       label: Version and install method
-      placeholder: v1.0.0 · npm / Docker · operating system
+      placeholder: v1.0.1 · npm / Docker · operating system
     validations:
       required: true
   - type: textarea

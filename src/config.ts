@@ -10,7 +10,8 @@ import {
   fsyncSync,
   closeSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { syncDirectory } from "./durable.js";
 import { homedir, platform } from "node:os";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { Profile, Settings } from "./contract.js";
@@ -34,6 +35,19 @@ export interface Config {
   accounts: Account[];
   demo: boolean;
 }
+export const LOCAL_RUNTIME_MISSING =
+  "The local CLIP runtime is not installed. It is optional: reinstall Tumblr Vault with optional dependencies (npm install --include=optional), or choose text search or Immich. Text search works without it.";
+// Replaceable for tests. Resolves without loading the heavy optional ONNX runtime.
+export const localRuntime = {
+  available() {
+    try {
+      import.meta.resolve("@huggingface/transformers");
+      return true;
+    } catch {
+      return false;
+    }
+  },
+};
 export function defaultDir() {
   return (
     process.env.VAULT_DATA_DIR ||
@@ -59,6 +73,7 @@ export function atomicJSON(path: string, value: unknown) {
   }
   renameSync(temp, path);
   chmodSync(path, 0o600);
+  syncDirectory(dirname(path));
 }
 export function hashPassword(password: string) {
   if (password.length < 12 || password.length > 1024)
@@ -107,10 +122,18 @@ export class Configuration {
       profiles: this.value.accounts.map(({ token, ...p }) => p),
       callbackUrl: baseUrl + "/oauth/callback",
       demo: this.value.demo,
+      localClipAvailable: localRuntime.available(),
     };
   }
   configure(input: Record<string, unknown>, initial = false) {
     const c = this.value;
+    // Checked synchronously with the write, so concurrent first-run requests cannot both
+    // claim the vault: exactly one sets the password, the rest receive 409.
+    if (initial && c.password)
+      throw Object.assign(
+        new Error("Setup is already complete. Unlock your vault."),
+        { statusCode: 409 },
+      );
     const next = { ...c };
     if (initial || input.password) {
       next.password = hashPassword(String(input.password || ""));
@@ -119,6 +142,12 @@ export class Configuration {
       if (!["off", "local", "immich"].includes(String(input.clip)))
         throw new Error("Choose an image search option.");
       next.clip = input.clip as Config["clip"];
+      if (
+        next.clip === "local" &&
+        c.clip !== "local" &&
+        !localRuntime.available()
+      )
+        throw new Error(LOCAL_RUNTIME_MISSING);
     }
     if (input.mlUrl !== undefined) {
       const url = String(input.mlUrl).replace(/\/$/, "");

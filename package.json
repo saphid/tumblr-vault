@@ -1,6 +1,6 @@
 {
   "name": "tumblr-vault",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Your Tumblr, kept. Local-first backup, reader and semantic image search with guided setup.",
   "type": "module",
   "license": "MIT",
@@ -49,10 +49,12 @@
   ],
   "dependencies": {
     "@fastify/static": "^10.1.7",
-    "@huggingface/transformers": "^4.3.1",
     "fastify": "^5.6.1",
     "proper-lockfile": "^4.1.2",
     "sharp": "^0.35.5"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.3.1"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -18,6 +18,10 @@ export interface Settings {
   profiles: Profile[];
   callbackUrl: string;
   demo: boolean;
+  /** False when the optional local CLIP runtime is not installed. */
+  localClipAvailable: boolean;
+  /** A one-time setup code from the server log is required (non-loopback exposure). */
+  setupCodeRequired?: boolean;
 }
 export interface Media {
   id: number;
@@ -26,6 +30,8 @@ export interface Media {
   saved: boolean;
   bytes: number;
   error?: string;
+  /** preview_unsupported (content) or preview_storage (retried next run). */
+  previewError?: string;
 }
 export interface Entry {
   id: string;
@@ -78,6 +84,7 @@ export interface Status {
   saved: number;
   unavailable: number;
   indexed: number;
+  previewsFailed: number;
   bytes: number;
   progress: Progress;
 }

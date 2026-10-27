@@ -506,6 +506,10 @@ svg {
   background: #27232f;
   border-color: #837095;
 }
+.choice.unavailable {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
 .choice input {
   width: 16px;
   height: 16px;
@@ -1245,8 +1249,13 @@ svg {
   margin: 8px 0;
   font-size: 12px;
 }
-.coverage .warning {
+.coverage .warning,
+.stats + .warning {
   color: #d7b1c7;
+}
+.stats + .warning {
+  margin: 16px 0 0;
+  font-size: 12px;
 }
 .indeterminate {
   height: 3px;

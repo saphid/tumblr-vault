@@ -1,6 +1,6 @@
 services:
   vault:
-    image: ghcr.io/saphid/tumblr-vault:1.0.0
+    image: ghcr.io/saphid/tumblr-vault:1.0.1
     build: .
     ports:
       - "127.0.0.1:4318:4318"

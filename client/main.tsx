@@ -412,6 +412,9 @@ function Wizard({
   const [step, setStep] = useState(0);
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [setupCode, setSetupCode] = useState(
+    () => new URLSearchParams(location.hash.slice(1)).get("setup") || "",
+  );
   const [clip, setClip] = useState<Settings["clip"]>("off");
   const [url, setUrl] = useState("");
   const [clientId, setClientId] = useState("");
@@ -424,9 +427,18 @@ function Wizard({
   useEffect(() => {
     heading.current?.focus();
   }, [step]);
+  useEffect(() => {
+    // The one-time code arrives in the link fragment; keep it out of history.
+    if (location.hash.includes("setup="))
+      history.replaceState(null, "", location.pathname + location.search);
+  }, []);
   const next = (e: FormEvent) => {
     e.preventDefault();
     setError("");
+    if (step === 0 && settings.setupCodeRequired && !setupCode.trim()) {
+      setError("Enter the setup code from the Tumblr Vault server log.");
+      return;
+    }
     if (step === 0 && (password.length < 12 || password !== confirm)) {
       setError(
         password.length < 12
@@ -453,6 +465,7 @@ function Wizard({
     try {
       await api("/api/setup", {
         password,
+        setupCode: settings.setupCodeRequired ? setupCode : undefined,
         clip,
         mlUrl: url,
         scheduleHours: schedule,
@@ -579,6 +592,21 @@ function Wizard({
                     onChange={(e) => setConfirm(e.target.value)}
                   />
                 </Field>
+                {settings.setupCodeRequired && (
+                  <Field
+                    label="One-time setup code"
+                    hint="This vault is reachable beyond this device. Copy the code printed where Vault started, or run docker compose logs."
+                  >
+                    <input
+                      autoComplete="one-time-code"
+                      autoCapitalize="characters"
+                      spellCheck={false}
+                      required
+                      value={setupCode}
+                      onChange={(e) => setSetupCode(e.target.value)}
+                    />
+                  </Field>
+                )}
                 <div className="storage-note">
                   <Icon name="download" />
                   <div>
@@ -619,24 +647,37 @@ function Wizard({
                         "Reuse a machine-learning service you already run.",
                       ],
                     ] as const
-                  ).map(([id, icon, title, desc]) => (
-                    <label
-                      className={"choice " + (clip === id ? "chosen" : "")}
-                      key={id}
-                    >
-                      <input
-                        type="radio"
-                        name="clip"
-                        checked={clip === id}
-                        onChange={() => setClip(id)}
-                      />
-                      <Icon name={icon} />
-                      <span>
-                        <b>{title}</b>
-                        <small>{desc}</small>
-                      </span>
-                    </label>
-                  ))}
+                  ).map(([id, icon, title, desc]) => {
+                    const missing =
+                      id === "local" && !settings.localClipAvailable;
+                    return (
+                      <label
+                        className={
+                          "choice " +
+                          (clip === id ? "chosen " : "") +
+                          (missing ? "unavailable" : "")
+                        }
+                        key={id}
+                      >
+                        <input
+                          type="radio"
+                          name="clip"
+                          checked={clip === id}
+                          disabled={missing}
+                          onChange={() => setClip(id)}
+                        />
+                        <Icon name={icon} />
+                        <span>
+                          <b>{title}</b>
+                          <small>
+                            {missing
+                              ? "Not installed. This install skipped the optional local CLIP runtime; reinstall with npm install --include=optional to add it."
+                              : desc}
+                          </small>
+                        </span>
+                      </label>
+                    );
+                  })}
                 </div>
                 {clip === "immich" && (
                   <Field label="Immich machine-learning URL">
@@ -1479,6 +1520,10 @@ function Post({
                   <span>
                     {m.kind} ·{" "}
                     {m.saved ? bytes(m.bytes) : m.error || "Not downloaded yet"}
+                    {m.previewError === "preview_storage" &&
+                      " · preview not written; retried next backup"}
+                    {m.previewError === "preview_unsupported" &&
+                      " · no preview for this format"}
                   </span>
                   {m.saved && (
                     <a
@@ -1632,6 +1677,13 @@ function Backup({
               </div>
             ))}
           </div>
+          {status.previewsFailed > 0 && (
+            <p className="warning">
+              {number(status.previewsFailed)} saved images have no preview.
+              Storage failures retry from the saved original on the next backup;
+              unsupported formats keep their downloadable original.
+            </p>
+          )}
           <h2 className="section-title">Account coverage</h2>
           {status.profiles.map((p) => (
             <div className="coverage" key={p.id}>
@@ -1692,6 +1744,7 @@ function Preferences({
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [password, setPassword] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
   const [label, setLabel] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -1709,10 +1762,12 @@ function Preferences({
         clientId,
         clientSecret,
         password,
+        currentPassword: password ? currentPassword : undefined,
       });
       setClientId("");
       setClientSecret("");
       setPassword("");
+      setCurrentPassword("");
       setMessage("Settings saved.");
       await refresh();
     } catch (e) {
@@ -1761,8 +1816,15 @@ function Preferences({
               onChange={(e) => setClip(e.target.value as Settings["clip"])}
             >
               <option value="off">Text search only</option>
-              <option value="local">
-                Local CLIP · model downloaded on first indexing
+              <option
+                value="local"
+                disabled={
+                  !settings.localClipAvailable && settings.clip !== "local"
+                }
+              >
+                {settings.localClipAvailable
+                  ? "Local CLIP · model downloaded on first indexing"
+                  : "Local CLIP · optional runtime not installed"}
               </option>
               <option value="immich">
                 Existing Immich machine-learning server
@@ -1783,6 +1845,8 @@ function Preferences({
             Local CLIP runs in TypeScript through ONNX. The first run needs
             internet, about 1 GB of disk and 2 GB of available RAM. Switching
             models requires reindexing.
+            {!settings.localClipAvailable &&
+              " Its optional runtime is not installed here; reinstall with npm install --include=optional to enable it."}
           </p>
           <Field label="Automatic backup interval">
             <select
@@ -1877,6 +1941,20 @@ function Preferences({
               onChange={(e) => setPassword(e.target.value)}
             />
           </Field>
+          {password && (
+            <Field
+              label="Current vault password"
+              hint="Required to set a new password. Other signed-in devices will be locked."
+            >
+              <input
+                type="password"
+                autoComplete="current-password"
+                required
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+              />
+            </Field>
+          )}
         </div>
         <button className="primary" disabled={busy}>
           {busy ? "Saving…" : "Save settings"}
